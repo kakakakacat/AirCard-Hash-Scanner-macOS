@@ -489,7 +489,7 @@ private struct EditableCardRow: View {
                 TextField(tr(language, "Card name", "卡片名称"), text: $draftName)
                     .textFieldStyle(.plain)
                     .font(.headline)
-                    .onChange(of: draftName) { value in onRename(value) }
+                    .onChange(of: draftName) { _, value in onRename(value) }
                 Text(card.hash)
                     .font(.system(.body, design: .monospaced))
                     .textSelection(.enabled)
