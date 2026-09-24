@@ -58,14 +58,23 @@ final class AppViewModel: ObservableObject {
     @Published var status = "Connect an unlocked iPhone by USB."
     @Published var isCheckingDevice = false
     @Published var isScanning = false
+    @Published var scanProgress = 0.0
     @Published var isFlashing = false
     @Published var flashProgress = 0.0
+    @Published var flashPhase = 0.0
+    @Published var flashCurrentCardName = ""
     @Published var artwork: [String: URL] = [:]
     @Published var errorMessage: String?
+    @Published var showPostScanReminder = false
+    @Published var showWriteCompleteReminder = false
 
     private let scriptDirectory: URL
     private let savedCardsKey = "aircard.hash-scanner.cards"
     private let savedArtworkKey = "aircard.wallet-tool.artwork"
+    private var scanProgressTask: Task<Void, Never>?
+    private var flashProgressTask: Task<Void, Never>?
+    private var flashCompletedCount = 0
+    private var flashTotalCount = 1
 
     init() {
         if let resources = Bundle.main.resourceURL,
@@ -111,12 +120,24 @@ final class AppViewModel: ObservableObject {
     func scanWallet() {
         guard isConnected, !isScanning else { return }
         isScanning = true
+        scanProgress = 0.03
         status = "Reading Wallet metadata. Do not disconnect the iPhone…"
         errorMessage = nil
+        let progressFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aircard-scan-\(UUID().uuidString).progress")
+        try? "0.03".write(to: progressFile, atomically: true, encoding: .utf8)
+        beginScanProgress(from: progressFile)
         let directory = scriptDirectory
         Task.detached {
-            let result = Self.runScanner(["--scan"], in: directory, timeout: 900)
+            let result = Self.runScanner(
+                ["--scan", "--progress-file", progressFile.path],
+                in: directory,
+                timeout: 900
+            )
             await MainActor.run {
+                self.scanProgressTask?.cancel()
+                self.scanProgressTask = nil
+                try? FileManager.default.removeItem(at: progressFile)
                 self.isScanning = false
                 switch result {
                 case .success(let data):
@@ -139,11 +160,28 @@ final class AppViewModel: ObservableObject {
                         return merged
                     }
                     self.saveCards()
+                    self.scanProgress = 1
                     self.status = "Found \(found.count) cards. Save the hashes now."
+                    self.showPostScanReminder = true
                 case .failure(let error):
                     self.status = "Wallet scan failed."
                     self.errorMessage = error.localizedDescription
                 }
+            }
+        }
+    }
+
+    private func beginScanProgress(from progressFile: URL) {
+        scanProgressTask?.cancel()
+        scanProgressTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 180_000_000)
+                guard let self, self.isScanning else { return }
+                guard let text = try? String(contentsOf: progressFile, encoding: .utf8),
+                      let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                    continue
+                }
+                self.scanProgress = min(0.98, max(self.scanProgress, value))
             }
         }
     }
@@ -233,9 +271,21 @@ final class AppViewModel: ObservableObject {
         panel.canChooseDirectories = false
         panel.message = "Choose artwork for the selected Wallet card(s)."
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        setArtwork(url, for: hashes)
+    }
+
+    @discardableResult
+    func setArtwork(_ url: URL, for hashes: [String]) -> Bool {
+        guard !hashes.isEmpty,
+              url.isFileURL,
+              UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true else {
+            errorMessage = "Drop a supported image file onto the card."
+            return false
+        }
         for hash in hashes { artwork[hash] = url }
         saveArtwork()
-        status = "Artwork selected for \(hashes.count) card(s)."
+        status = "Artwork selected for \(hashes.count) card(s). Preview it before applying."
+        return true
     }
 
     func clearArtwork(for hash: String) {
@@ -257,15 +307,32 @@ final class AppViewModel: ObservableObject {
 
         isFlashing = true
         flashProgress = 0
+        flashPhase = 0
+        flashCompletedCount = 0
+        flashTotalCount = jobs.count
+        flashCurrentCardName = cards.first(where: { $0.hash == jobs[0].0 })?.displayName ?? jobs[0].0
         status = "Applying Wallet covers…"
         errorMessage = nil
         let directory = scriptDirectory
+        let progressFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aircard-write-\(UUID().uuidString).progress")
+        try? "0.0".write(to: progressFile, atomically: true, encoding: .utf8)
+        beginFlashProgress(from: progressFile)
 
         Task.detached {
             var failures: [String] = []
             for (index, job) in jobs.enumerated() {
+                try? "0.0".write(to: progressFile, atomically: true, encoding: .utf8)
+                await MainActor.run {
+                    self.flashCompletedCount = index
+                    self.flashPhase = 0
+                    self.flashCurrentCardName = self.cards.first(where: { $0.hash == job.0 })?.displayName
+                        ?? job.0
+                }
                 let result = Self.runScanner(
-                    ["--flash", job.0, job.1.path], in: directory, timeout: 900
+                    ["--flash", job.0, job.1.path, "--progress-file", progressFile.path],
+                    in: directory,
+                    timeout: 900
                 )
                 switch result {
                 case .success(let data):
@@ -277,19 +344,45 @@ final class AppViewModel: ObservableObject {
                     failures.append(error.localizedDescription)
                 }
                 await MainActor.run {
+                    self.flashCompletedCount = index + 1
+                    self.flashPhase = 1
                     self.flashProgress = Double(index + 1) / Double(jobs.count)
                     self.status = "Applied \(index + 1) of \(jobs.count) cover(s)…"
                 }
             }
             let failureMessages = failures
             await MainActor.run {
+                self.flashProgressTask?.cancel()
+                self.flashProgressTask = nil
+                try? FileManager.default.removeItem(at: progressFile)
                 self.isFlashing = false
                 if failureMessages.isEmpty {
                     self.status = "All selected covers were applied. Reopen Wallet to refresh."
+                    self.showWriteCompleteReminder = true
                 } else {
                     self.status = "One or more covers could not be applied."
                     self.errorMessage = failureMessages.joined(separator: "\n")
                 }
+            }
+        }
+    }
+
+    private func beginFlashProgress(from progressFile: URL) {
+        flashProgressTask?.cancel()
+        flashProgressTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 180_000_000)
+                guard let self, self.isFlashing else { return }
+                guard let text = try? String(contentsOf: progressFile, encoding: .utf8),
+                      let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                    continue
+                }
+                self.flashPhase = min(1, max(0, value))
+                self.flashProgress = min(
+                    0.99,
+                    (Double(self.flashCompletedCount) + self.flashPhase)
+                        / Double(max(1, self.flashTotalCount))
+                )
             }
         }
     }
@@ -370,6 +463,8 @@ struct ContentView: View {
     @AppStorage("aircard.hash-scanner.language") private var languageRaw = AppLanguage.english.rawValue
     @State private var showScanConfirmation = false
     @State private var showImportSheet = false
+    @State private var showWriteConfirmation = false
+    @State private var pendingWriteHashes: [String] = []
 
     private var language: AppLanguage { AppLanguage(rawValue: languageRaw) ?? .english }
 
@@ -390,7 +485,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity)
             }
         }
-        .frame(minWidth: 760, minHeight: 680)
+        .frame(minWidth: 820, minHeight: 720)
         .background(Color(nsColor: .windowBackgroundColor))
         .alert(tr(language, "Read Wallet now?", "现在读取 Wallet？"), isPresented: $showScanConfirmation) {
             Button(tr(language, "Cancel", "取消"), role: .cancel) {}
@@ -399,6 +494,35 @@ struct ContentView: View {
             Text(tr(language,
                     "This operation temporarily moves protected Wallet metadata while reading it. Cards may disappear until the iPhone is restarted. Do not disconnect the cable.",
                     "读取过程中会暂时移动受保护的 Wallet 元数据。卡片可能暂时消失，直到重启 iPhone。操作时不要断开数据线。"))
+        }
+        .alert(tr(language, "Check Wallet before continuing", "继续前请检查 Wallet"),
+               isPresented: $model.showPostScanReminder) {
+            Button(tr(language, "I checked Wallet", "我已检查 Wallet"), role: .cancel) {}
+        } message: {
+            Text(tr(language,
+                    "The hashes were read successfully. Open Wallet on the iPhone now. If cards disappeared or Wallet was reset, do not apply a cover yet—restart the iPhone and wait several minutes until every card has returned. Then verify the default Express Transit Card before continuing.",
+                    "Hash 已读取成功。请立即在 iPhone 上打开 Wallet 检查卡片。如果卡片消失或钱包被重置，请先不要写入封面；重启 iPhone 并等待几分钟，确认全部卡片恢复后，再检查默认快捷交通卡并继续操作。"))
+        }
+        .alert(tr(language, "Apply selected cover?", "确认写入所选封面？"),
+               isPresented: $showWriteConfirmation) {
+            Button(tr(language, "Cancel", "取消"), role: .cancel) { pendingWriteHashes.removeAll() }
+            Button(tr(language, "Confirm and apply", "确认并写入"), role: .destructive) {
+                let hashes = pendingWriteHashes
+                pendingWriteHashes.removeAll()
+                model.applyCovers(hashes: hashes)
+            }
+        } message: {
+            Text(tr(language,
+                    "The preview will be written to \(pendingWriteHashes.count) card(s). Continue only after checking that Wallet and all cards have fully recovered.",
+                    "即将把预览封面写入 \(pendingWriteHashes.count) 张卡片。请仅在确认 Wallet 和全部卡片已经完全恢复后继续。"))
+        }
+        .alert(tr(language, "Cover update complete", "封面写入完成"),
+               isPresented: $model.showWriteCompleteReminder) {
+            Button(tr(language, "Got it", "知道了"), role: .cancel) {}
+        } message: {
+            Text(tr(language,
+                    "The selected covers were written successfully. On the iPhone, completely close the Wallet app and open it again to refresh the card covers.",
+                    "所选封面已写入成功。请在 iPhone 上完全关闭 Wallet 应用，然后重新打开 Wallet，以刷新并显示新的卡片封面。"))
         }
         .alert(tr(language, "Error", "错误"), isPresented: Binding(
             get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } }
@@ -499,8 +623,32 @@ struct ContentView: View {
                     .disabled(model.isScanning)
                 }
                 Text(model.status).font(.callout).foregroundStyle(.secondary)
+                if model.isScanning {
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack {
+                            Text(scanProgressLabel).font(.caption.bold())
+                            Spacer()
+                            Text("\(Int(model.scanProgress * 100))%")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        ProgressView(value: model.scanProgress, total: 1)
+                            .progressViewStyle(.linear)
+                    }
+                    .padding(12)
+                    .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                }
             }
         }
+    }
+
+    private var scanProgressLabel: String {
+        if model.scanProgress < 0.22 {
+            return tr(language, "Preparing secure Wallet access…", "正在准备安全访问 Wallet…")
+        }
+        if model.scanProgress < 0.72 {
+            return tr(language, "Reading protected Wallet metadata…", "正在读取受保护的 Wallet 元数据…")
+        }
+        return tr(language, "Restoring Wallet files and parsing cards…", "正在恢复 Wallet 文件并解析卡片…")
     }
 
     private var resultsCard: some View {
@@ -520,23 +668,34 @@ struct ContentView: View {
                         Label(tr(language, "Choose cover for all", "为全部卡片选择封面"), systemImage: "photo.badge.plus")
                     }
                     Button {
-                        model.applyCovers()
+                        requestCoverWrite(model.cards.map(\.hash))
                     } label: {
-                        Label(tr(language, "Apply selected covers", "写入已选择的封面"), systemImage: "wand.and.stars")
+                        Label(tr(language, "Review and apply covers", "预览并确认写入"), systemImage: "wand.and.stars")
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!model.isConnected || model.isFlashing || model.artwork.isEmpty)
                     Spacer()
-                    if model.isFlashing {
-                        ProgressView(value: model.flashProgress).frame(width: 150)
-                        Text("\(Int(model.flashProgress * 100))%")
-                            .font(.system(.caption, design: .monospaced))
+                }
+                if model.isFlashing {
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack(spacing: 8) {
+                            Text(flashProgressLabel).font(.caption.bold())
+                            Text(model.flashCurrentCardName)
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            Spacer()
+                            Text("\(Int(model.flashProgress * 100))%")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        ProgressView(value: model.flashProgress, total: 1)
+                            .progressViewStyle(.linear)
                     }
+                    .padding(12)
+                    .background(Color.purple.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
                 }
                 Divider()
-                LazyVStack(spacing: 8) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 320), spacing: 14)], spacing: 14) {
                     ForEach(model.cards) { card in
-                        EditableCardRow(
+                        EditableCardTile(
                             language: language,
                             card: card,
                             artworkURL: model.artwork[card.hash],
@@ -545,13 +704,36 @@ struct ContentView: View {
                             onResetName: { model.renameCard(hash: card.hash, name: "") },
                             onCopy: { model.copy(card.hash) },
                             onChooseArtwork: { model.chooseArtwork(for: [card.hash]) },
+                            onDropArtwork: { model.setArtwork($0, for: [card.hash]) },
                             onClearArtwork: { model.clearArtwork(for: card.hash) },
-                            onApplyArtwork: { model.applyCovers(hashes: [card.hash]) }
+                            onApplyArtwork: { requestCoverWrite([card.hash]) }
                         )
                     }
                 }
             }
         }
+    }
+
+    private var flashProgressLabel: String {
+        if model.flashPhase < 0.24 {
+            return tr(language, "Preparing artwork…", "正在处理封面图片…")
+        }
+        if model.flashPhase < 0.74 {
+            return tr(language, "Writing Wallet assets…", "正在写入 Wallet 素材…")
+        }
+        return tr(language, "Refreshing Wallet caches…", "正在刷新 Wallet 缓存…")
+    }
+
+    private func requestCoverWrite(_ hashes: [String]) {
+        let selected = hashes.filter { model.artwork[$0] != nil }
+        guard !selected.isEmpty else {
+            model.errorMessage = tr(language,
+                                    "Choose or drop artwork onto at least one card first.",
+                                    "请先为至少一张卡片选择或拖入封面图片。")
+            return
+        }
+        pendingWriteHashes = selected
+        showWriteConfirmation = true
     }
 
     private var recoveryCard: some View {
@@ -581,7 +763,7 @@ struct ContentView: View {
     }
 }
 
-private struct EditableCardRow: View {
+private struct EditableCardTile: View {
     let language: AppLanguage
     let card: WalletCard
     let artworkURL: URL?
@@ -590,9 +772,11 @@ private struct EditableCardRow: View {
     let onResetName: () -> Void
     let onCopy: () -> Void
     let onChooseArtwork: () -> Void
+    let onDropArtwork: (URL) -> Bool
     let onClearArtwork: () -> Void
     let onApplyArtwork: () -> Void
     @State private var draftName: String
+    @State private var isDropTarget = false
 
     init(
         language: AppLanguage,
@@ -603,6 +787,7 @@ private struct EditableCardRow: View {
         onResetName: @escaping () -> Void,
         onCopy: @escaping () -> Void,
         onChooseArtwork: @escaping () -> Void,
+        onDropArtwork: @escaping (URL) -> Bool,
         onClearArtwork: @escaping () -> Void,
         onApplyArtwork: @escaping () -> Void
     ) {
@@ -614,67 +799,100 @@ private struct EditableCardRow: View {
         self.onResetName = onResetName
         self.onCopy = onCopy
         self.onChooseArtwork = onChooseArtwork
+        self.onDropArtwork = onDropArtwork
         self.onClearArtwork = onClearArtwork
         self.onApplyArtwork = onApplyArtwork
         _draftName = State(initialValue: card.displayName)
     }
 
     var body: some View {
-        HStack(spacing: 12) {
-            Group {
+        VStack(alignment: .leading, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(Color.secondary.opacity(0.08))
                 if let artworkURL, let image = NSImage(contentsOf: artworkURL) {
                     Image(nsImage: image)
                         .resizable()
-                        .scaledToFill()
+                        .aspectRatio(contentMode: .fill)
                 } else {
-                    Image(systemName: "creditcard.fill")
-                        .resizable()
-                        .scaledToFit()
-                        .padding(10)
-                        .foregroundStyle(.blue)
+                    VStack(spacing: 10) {
+                        Image(systemName: "photo.badge.plus")
+                            .font(.system(size: 42, weight: .medium))
+                            .foregroundStyle(.blue)
+                        Text(tr(language, "Drop an image here", "拖拽图片到这里"))
+                            .font(.headline)
+                        Text(tr(language, "or click Choose cover", "或点击“选择封面”"))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if isDropTarget {
+                    RoundedRectangle(cornerRadius: 14)
+                        .fill(Color.blue.opacity(0.18))
+                    VStack(spacing: 8) {
+                        Image(systemName: "arrow.down.circle.fill").font(.system(size: 38))
+                        Text(tr(language, "Release to preview", "松开以预览"))
+                            .font(.headline)
+                    }
+                    .foregroundStyle(.blue)
                 }
             }
-            .frame(width: 76, height: 48)
-            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            VStack(alignment: .leading, spacing: 3) {
+            .aspectRatio(1536.0 / 969.0, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14)
+                .stroke(isDropTarget ? Color.blue : Color.secondary.opacity(0.18),
+                        lineWidth: isDropTarget ? 3 : 1))
+            .dropDestination(for: URL.self) { urls, _ in
+                guard let url = urls.first else { return false }
+                return onDropArtwork(url)
+            } isTargeted: { isDropTarget = $0 }
+
+            VStack(alignment: .leading, spacing: 6) {
                 TextField(tr(language, "Card name", "卡片名称"), text: $draftName)
-                    .textFieldStyle(.plain)
-                    .font(.headline)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.title3.bold())
                     .onChange(of: draftName) { _, value in onRename(value) }
-                Text(card.hash)
-                    .font(.system(.body, design: .monospaced))
-                    .textSelection(.enabled)
+                HStack(spacing: 6) {
+                    Text(card.hash)
+                        .font(.system(.caption, design: .monospaced))
+                        .lineLimit(1)
+                        .textSelection(.enabled)
+                    Spacer(minLength: 4)
+                    Button(action: onCopy) { Image(systemName: "doc.on.doc") }
+                        .buttonStyle(.borderless)
+                        .help(tr(language, "Copy hash", "复制 Hash"))
+                }
             }
-            Spacer()
-            if card.customName != nil {
-                Button {
-                    draftName = card.name ?? tr(language, "Unnamed card", "未命名卡片")
-                    onResetName()
-                } label: { Image(systemName: "arrow.uturn.backward") }
-                    .buttonStyle(.borderless)
-                    .help(tr(language, "Restore scanned name", "恢复扫描名称"))
-            }
-            Button(action: onCopy) { Image(systemName: "doc.on.doc") }
-                .buttonStyle(.borderless)
-                .help(tr(language, "Copy hash", "复制 Hash"))
-            Button(action: onChooseArtwork) { Image(systemName: "photo.badge.plus") }
-                .buttonStyle(.borderless)
-                .help(tr(language, "Choose cover", "选择封面"))
+
+            HStack(spacing: 8) {
+                if card.customName != nil {
+                    Button {
+                        draftName = card.name ?? tr(language, "Unnamed card", "未命名卡片")
+                        onResetName()
+                    } label: { Image(systemName: "arrow.uturn.backward") }
+                        .help(tr(language, "Restore scanned name", "恢复扫描名称"))
+                }
+                Button(action: onChooseArtwork) {
+                    Label(tr(language, "Choose cover", "选择封面"), systemImage: "photo.badge.plus")
+                }
                 .disabled(isFlashing)
-            if artworkURL != nil {
-                Button(action: onClearArtwork) { Image(systemName: "xmark.circle") }
-                    .buttonStyle(.borderless)
-                    .help(tr(language, "Clear selected cover", "清除已选择封面"))
-                    .disabled(isFlashing)
-                Button(action: onApplyArtwork) { Image(systemName: "wand.and.stars") }
+                if artworkURL != nil {
+                    Button(action: onClearArtwork) { Image(systemName: "xmark.circle") }
+                        .help(tr(language, "Clear selected cover", "清除已选择封面"))
+                        .disabled(isFlashing)
+                    Spacer()
+                    Button(action: onApplyArtwork) {
+                        Label(tr(language, "Confirm write", "确认写入"), systemImage: "wand.and.stars")
+                    }
                     .buttonStyle(.borderedProminent)
-                    .help(tr(language, "Apply this cover", "写入这张封面"))
                     .disabled(isFlashing)
+                } else {
+                    Spacer()
+                }
             }
         }
-        .padding(12)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .padding(14)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.secondary.opacity(0.14)))
     }
 }
 

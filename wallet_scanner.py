@@ -117,16 +117,20 @@ def read_cards(database_path: Path) -> list[dict]:
         database.close()
 
 
-def scan_wallet(udid: str) -> dict:
+def scan_wallet(udid: str, report_progress=None) -> dict:
+    report = report_progress or (lambda _value: None)
+    report(0.18)
     with tempfile.TemporaryDirectory(prefix="aircard-wallet-scan-") as temporary:
         directory = Path(temporary)
         database_path = directory / DATABASE_NAME
         database_bytes = read_file(udid, PASSES_DIRECTORY, DATABASE_NAME, retries=1)
         if not database_bytes:
             return {"ok": False, "cards": [], "error": "Unable to read Wallet database."}
+        report(0.70)
         database_path.write_bytes(database_bytes)
 
         try:
+            report(0.86)
             cards = read_cards(database_path)
         except sqlite3.DatabaseError:
             # A live SQLite database may need its WAL/SHM sidecars for a consistent read.
@@ -135,6 +139,7 @@ def scan_wallet(udid: str) -> dict:
                 if data:
                     (directory / (DATABASE_NAME + suffix)).write_bytes(data)
             try:
+                report(0.92)
                 cards = read_cards(database_path)
             except (sqlite3.DatabaseError, RuntimeError) as error:
                 return {"ok": False, "cards": [], "error": str(error)}
@@ -143,17 +148,27 @@ def scan_wallet(udid: str) -> dict:
 
         if not cards:
             return {"ok": False, "cards": [], "error": "No Wallet card hashes were found."}
+        report(1.0)
         return {"ok": True, "cards": cards, "error": None}
 
 
-def flash_cover(udid: str, card_hash: str, image_path: Path) -> dict:
+def progress_writer(path: Path | None):
+    def write(value: float) -> None:
+        if path is not None:
+            path.write_text(f"{max(0.0, min(1.0, value)):.2f}", encoding="utf-8")
+    return write
+
+
+def flash_cover(udid: str, card_hash: str, image_path: Path, report_progress=None) -> dict:
     """Apply one cover using the original Mac three-asset write behavior."""
+    report = report_progress or (lambda _value: None)
     if normalize_hash(card_hash) != card_hash:
         return {"ok": False, "error": "Invalid Wallet card hash."}
     if not image_path.is_file():
         return {"ok": False, "error": "Artwork file was not found."}
 
     try:
+        report(0.08)
         with tempfile.TemporaryDirectory(prefix="aircard-cover-") as temporary:
             prepared = Path(temporary) / "cover.png"
             subprocess.run(
@@ -164,10 +179,12 @@ def flash_cover(udid: str, card_hash: str, image_path: Path) -> dict:
                 stderr=subprocess.PIPE,
             )
             assets = build_card_assets(prepared.read_bytes())
+        report(0.22)
     except (OSError, subprocess.SubprocessError) as error:
         return {"ok": False, "error": f"Unable to prepare artwork: {error}"}
 
     pass_directory = f"/var/mobile/Library/Passes/Cards/{card_hash}.pkpass"
+    report(0.28)
     wrote = write_files_batch(udid, pass_directory, list(assets), retries=3)
     if not wrote:
         wrote = all(
@@ -176,18 +193,21 @@ def flash_cover(udid: str, card_hash: str, image_path: Path) -> dict:
         )
     if not wrote:
         return {"ok": False, "error": "Unable to write the three Wallet artwork files."}
+    report(0.72)
 
     cache_ok = True
-    for suffix in (".cache", ".pkcache"):
+    for index, suffix in enumerate((".cache", ".pkcache")):
         cache_directory = f"/var/mobile/Library/Passes/Cards/{card_hash}{suffix}"
         cache_ok = remove_files(
             udid, cache_directory, list(CACHE_FILES), retries=3
         ) and cache_ok
+        report(0.84 if index == 0 else 0.96)
     if not cache_ok:
         return {
             "ok": False,
             "error": "Artwork was written, but one or more rendered Wallet caches could not be removed.",
         }
+    report(1.0)
     return {"ok": True, "error": None}
 
 
@@ -197,19 +217,37 @@ def main() -> int:
         print(json.dumps(device_response(), ensure_ascii=False))
         return 0
     if command == "--scan":
+        progress_path = (
+            Path(sys.argv[3])
+            if len(sys.argv) == 4 and sys.argv[2] == "--progress-file"
+            else None
+        )
+        report = progress_writer(progress_path)
+        report(0.08)
         device = connected_iphone()
         if not device:
             print(json.dumps({"ok": False, "cards": [], "error": "No trusted iPhone found."}))
             return 0
-        result = scan_wallet(str(device["udid"]))
+        report(0.12)
+        result = scan_wallet(str(device["udid"]), report)
         print(json.dumps(result, ensure_ascii=False))
         return 0
-    if command == "--flash" and len(sys.argv) == 4:
+    if command == "--flash" and len(sys.argv) in (4, 6):
+        progress_path = (
+            Path(sys.argv[5])
+            if len(sys.argv) == 6 and sys.argv[4] == "--progress-file"
+            else None
+        )
+        report = progress_writer(progress_path)
+        report(0.03)
         device = connected_iphone()
         if not device:
             print(json.dumps({"ok": False, "error": "No trusted iPhone found."}))
             return 0
-        result = flash_cover(str(device["udid"]), sys.argv[2], Path(sys.argv[3]))
+        report(0.05)
+        result = flash_cover(
+            str(device["udid"]), sys.argv[2], Path(sys.argv[3]), report
+        )
         print(json.dumps(result, ensure_ascii=False))
         return 0
     print(json.dumps({"ok": False, "error": "Use --device, --scan or --flash."}))

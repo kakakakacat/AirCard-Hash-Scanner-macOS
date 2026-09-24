@@ -21,12 +21,24 @@ for required in (
     'func importHashes',
     'func renameCard',
     'AirCard Wallet Tool',
-    'Apply selected covers',
-    '写入已选择的封面',
+    'Review and apply covers',
+    '预览并确认写入',
     'Express Transit Card',
     '快捷交通卡',
     'savedArtworkKey',
     'func applyCovers',
+    'scanProgress',
+    'Check Wallet before continuing',
+    '继续前请检查 Wallet',
+    'dropDestination(for: URL.self)',
+    'Confirm and apply',
+    '确认并写入',
+    'EditableCardTile',
+    'flashPhase',
+    'Cover update complete',
+    '封面写入完成',
+    'completely close the Wallet app',
+    '完全关闭 Wallet 应用',
 ):
     assert required in SWIFT, required
 
@@ -58,6 +70,8 @@ assert 'Express Transit Card' in README
 assert '快捷交通卡' in README
 assert 'saved automatically' in README
 assert '自动保存' in README
+assert 'drag-and-drop' in README
+assert (ROOT / 'Assets' / 'AirCardWalletToolIcon.png').is_file()
 
 for obsolete in ('aircard.py', 'aircard_backend.py'):
     assert not (ROOT / obsolete).exists(), obsolete

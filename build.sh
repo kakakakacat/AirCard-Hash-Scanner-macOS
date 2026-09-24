@@ -10,6 +10,8 @@ CONTENTS_DIR="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 BIN_DIR="${RESOURCES_DIR}/bin"
+ICON_MASTER="Assets/AirCardWalletToolIcon.png"
+ICONSET_DIR="build/AirCardWalletTool.iconset"
 
 echo "==> [1/5] Building USB and AirTraffic helpers"
 make clean
@@ -30,6 +32,7 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'EOF'
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>AirCard Wallet Tool</string>
     <key>CFBundleDisplayName</key><string>AirCard Wallet Tool</string>
+    <key>CFBundleIconFile</key><string>AirCardWalletTool</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0.0</string>
     <key>CFBundleVersion</key><string>1</string>
@@ -42,6 +45,18 @@ EOF
 
 cp build/device_helper build/airtraffic_host "$BIN_DIR/"
 cp wallet_scanner.py apply_card_skin.py card_assets.py "$RESOURCES_DIR/"
+
+if [[ ! -f "$ICON_MASTER" ]]; then
+    echo "Missing icon master: $ICON_MASTER" >&2
+    exit 1
+fi
+mkdir -p "$ICONSET_DIR"
+for size in 16 32 128 256 512; do
+    double=$((size * 2))
+    sips -z "$size" "$size" "$ICON_MASTER" --out "$ICONSET_DIR/icon_${size}x${size}.png" >/dev/null
+    sips -z "$double" "$double" "$ICON_MASTER" --out "$ICONSET_DIR/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/AirCardWalletTool.icns"
 
 echo "==> [3/5] Compiling universal SwiftUI application"
 SWIFT_SDK="${SWIFT_SDK:-$(xcrun --sdk macosx --show-sdk-path)}"
@@ -62,6 +77,10 @@ DMG_ROOT="$(mktemp -d /tmp/aircard-hash-scanner.XXXXXX)"
 trap 'rm -rf "$DMG_ROOT"' EXIT
 cp -R "$APP_DIR" "$DMG_ROOT/"
 ln -s /Applications "$DMG_ROOT/Applications"
+cp "$RESOURCES_DIR/AirCardWalletTool.icns" "$DMG_ROOT/.VolumeIcon.icns"
+if command -v SetFile >/dev/null 2>&1; then
+    SetFile -a C "$DMG_ROOT"
+fi
 rm -f build/AirCard-Wallet-Tool.dmg
 hdiutil create -volname "AirCard Wallet Tool" -srcfolder "$DMG_ROOT" \
     -ov -format UDZO build/AirCard-Wallet-Tool.dmg

@@ -59,6 +59,15 @@ class WalletScannerTests(unittest.TestCase):
             wallet_scanner.DATABASE_NAME, retries=1
         )
 
+    def test_scan_reports_monotonic_progress(self):
+        payload = database_bytes([(VALID_HASH_1, "Transit Card", None, "1")])
+        progress = []
+        with patch.object(wallet_scanner, "read_file", return_value=payload):
+            result = wallet_scanner.scan_wallet("device-udid", progress.append)
+        self.assertTrue(result["ok"])
+        self.assertEqual(progress, sorted(progress))
+        self.assertEqual(progress[-1], 1.0)
+
     def test_flash_cover_writes_three_assets_and_removes_both_caches(self):
         def fake_sips(arguments, **_kwargs):
             Path(arguments[arguments.index("--out") + 1]).write_bytes(b"png")
@@ -82,6 +91,27 @@ class WalletScannerTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(len(writer.call_args.args[2]), 3)
         self.assertEqual(remover.call_count, 2)
+
+    def test_flash_cover_reports_live_progress(self):
+        def fake_sips(arguments, **_kwargs):
+            Path(arguments[arguments.index("--out") + 1]).write_bytes(b"png")
+
+        progress = []
+        with tempfile.TemporaryDirectory() as temporary:
+            image = Path(temporary) / "source.png"
+            image.write_bytes(b"image")
+            with (
+                patch.object(wallet_scanner.subprocess, "run", side_effect=fake_sips),
+                patch.object(wallet_scanner, "build_card_assets", return_value=(("a", b"a"),)),
+                patch.object(wallet_scanner, "write_files_batch", return_value=True),
+                patch.object(wallet_scanner, "remove_files", return_value=True),
+            ):
+                result = wallet_scanner.flash_cover(
+                    "device-udid", VALID_HASH_1, image, progress.append
+                )
+        self.assertTrue(result["ok"])
+        self.assertEqual(progress, sorted(progress))
+        self.assertEqual(progress[-1], 1.0)
 
 
 if __name__ == "__main__":
