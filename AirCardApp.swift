@@ -281,13 +281,14 @@ final class AppViewModel: ObservableObject {
                     self.status = "Applied \(index + 1) of \(jobs.count) cover(s)…"
                 }
             }
+            let failureMessages = failures
             await MainActor.run {
                 self.isFlashing = false
-                if failures.isEmpty {
+                if failureMessages.isEmpty {
                     self.status = "All selected covers were applied. Reopen Wallet to refresh."
                 } else {
                     self.status = "One or more covers could not be applied."
-                    self.errorMessage = failures.joined(separator: "\n")
+                    self.errorMessage = failureMessages.joined(separator: "\n")
                 }
             }
         }
