@@ -59,6 +59,30 @@ class WalletScannerTests(unittest.TestCase):
             wallet_scanner.DATABASE_NAME, retries=1
         )
 
+    def test_flash_cover_writes_three_assets_and_removes_both_caches(self):
+        def fake_sips(arguments, **_kwargs):
+            Path(arguments[arguments.index("--out") + 1]).write_bytes(b"png")
+
+        assets = (
+            ("cardBackgroundCombined@3x.png", b"png"),
+            ("cardBackgroundCombined@2x.png", b"png"),
+            ("cardBackgroundCombined.pdf", b"pdf"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            image = Path(temporary) / "source.jpg"
+            image.write_bytes(b"image")
+            with (
+                patch.object(wallet_scanner.subprocess, "run", side_effect=fake_sips),
+                patch.object(wallet_scanner, "build_card_assets", return_value=assets),
+                patch.object(wallet_scanner, "write_files_batch", return_value=True) as writer,
+                patch.object(wallet_scanner, "remove_files", return_value=True) as remover,
+            ):
+                result = wallet_scanner.flash_cover("device-udid", VALID_HASH_1, image)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(writer.call_args.args[2]), 3)
+        self.assertEqual(remover.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

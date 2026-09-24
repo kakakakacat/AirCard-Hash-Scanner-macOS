@@ -1,4 +1,4 @@
-name: Build macOS Hash Scanner
+name: Build AirCard Wallet Tool
 
 on:
   workflow_dispatch:
@@ -16,11 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run scanner-only tests
+      - name: Run Wallet tool tests
         run: |
           python3 -m unittest tests.test_read_file tests.test_wallet_scanner
           python3 tests/verify_scanner_only.py
-          python3 -m py_compile wallet_scanner.py apply_card_skin.py
+          python3 -m py_compile wallet_scanner.py apply_card_skin.py card_assets.py
 
       - name: Build universal macOS app and DMG
         run: |
@@ -30,20 +30,20 @@ jobs:
       - name: Save release files
         run: |
           mkdir -p release
-          cp build/AirCard-Hash-Scanner.dmg release/AirCard-Hash-Scanner.dmg
-          shasum -a 256 release/AirCard-Hash-Scanner.dmg > release/AirCard-Hash-Scanner.dmg.sha256
+          cp build/AirCard-Wallet-Tool.dmg release/AirCard-Wallet-Tool.dmg
+          shasum -a 256 release/AirCard-Wallet-Tool.dmg > release/AirCard-Wallet-Tool.dmg.sha256
 
       - uses: actions/upload-artifact@v4
         with:
-          name: AirCard-Hash-Scanner-macOS
+          name: AirCard-Wallet-Tool-macOS
           path: |
-            release/AirCard-Hash-Scanner.dmg
-            release/AirCard-Hash-Scanner.dmg.sha256
+            release/AirCard-Wallet-Tool.dmg
+            release/AirCard-Wallet-Tool.dmg.sha256
 
       - name: Commit DMG to release directory
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add release/AirCard-Hash-Scanner.dmg release/AirCard-Hash-Scanner.dmg.sha256
-          git diff --cached --quiet || git commit -m "Add macOS hash scanner DMG [skip ci]"
+          git add release/AirCard-Wallet-Tool.dmg release/AirCard-Wallet-Tool.dmg.sha256
+          git diff --cached --quiet || git commit -m "Add AirCard Wallet Tool DMG [skip ci]"
           git push

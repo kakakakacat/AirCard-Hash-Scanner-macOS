@@ -12,7 +12,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-from apply_card_skin import DEVICE_HELPER, read_file
+from apply_card_skin import (
+    DEVICE_HELPER,
+    read_file,
+    remove_files,
+    write_file,
+    write_files_batch,
+)
+from card_assets import CACHE_FILES, build_card_assets
 
 PASSES_DIRECTORY = "/var/mobile/Library/Passes"
 DATABASE_NAME = "passes23.sqlite"
@@ -139,6 +146,51 @@ def scan_wallet(udid: str) -> dict:
         return {"ok": True, "cards": cards, "error": None}
 
 
+def flash_cover(udid: str, card_hash: str, image_path: Path) -> dict:
+    """Apply one cover using the original Mac three-asset write behavior."""
+    if normalize_hash(card_hash) != card_hash:
+        return {"ok": False, "error": "Invalid Wallet card hash."}
+    if not image_path.is_file():
+        return {"ok": False, "error": "Artwork file was not found."}
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="aircard-cover-") as temporary:
+            prepared = Path(temporary) / "cover.png"
+            subprocess.run(
+                ["/usr/bin/sips", "-s", "format", "png", "-z", "969", "1536",
+                 str(image_path), "--out", str(prepared)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            assets = build_card_assets(prepared.read_bytes())
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"ok": False, "error": f"Unable to prepare artwork: {error}"}
+
+    pass_directory = f"/var/mobile/Library/Passes/Cards/{card_hash}.pkpass"
+    wrote = write_files_batch(udid, pass_directory, list(assets), retries=3)
+    if not wrote:
+        wrote = all(
+            write_file(udid, pass_directory, leaf, payload, retries=3)
+            for leaf, payload in assets
+        )
+    if not wrote:
+        return {"ok": False, "error": "Unable to write the three Wallet artwork files."}
+
+    cache_ok = True
+    for suffix in (".cache", ".pkcache"):
+        cache_directory = f"/var/mobile/Library/Passes/Cards/{card_hash}{suffix}"
+        cache_ok = remove_files(
+            udid, cache_directory, list(CACHE_FILES), retries=3
+        ) and cache_ok
+    if not cache_ok:
+        return {
+            "ok": False,
+            "error": "Artwork was written, but one or more rendered Wallet caches could not be removed.",
+        }
+    return {"ok": True, "error": None}
+
+
 def main() -> int:
     command = sys.argv[1] if len(sys.argv) > 1 else ""
     if command == "--device":
@@ -152,7 +204,15 @@ def main() -> int:
         result = scan_wallet(str(device["udid"]))
         print(json.dumps(result, ensure_ascii=False))
         return 0
-    print(json.dumps({"ok": False, "error": "Use --device or --scan."}))
+    if command == "--flash" and len(sys.argv) == 4:
+        device = connected_iphone()
+        if not device:
+            print(json.dumps({"ok": False, "error": "No trusted iPhone found."}))
+            return 0
+        result = flash_cover(str(device["udid"]), sys.argv[2], Path(sys.argv[3]))
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    print(json.dumps({"ok": False, "error": "Use --device, --scan or --flash."}))
     return 2
 
 

@@ -46,6 +46,11 @@ private struct ScanResponse: Decodable {
     let error: String?
 }
 
+private struct OperationResponse: Decodable {
+    let ok: Bool
+    let error: String?
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published var device: DeviceInfo?
@@ -53,10 +58,14 @@ final class AppViewModel: ObservableObject {
     @Published var status = "Connect an unlocked iPhone by USB."
     @Published var isCheckingDevice = false
     @Published var isScanning = false
+    @Published var isFlashing = false
+    @Published var flashProgress = 0.0
+    @Published var artwork: [String: URL] = [:]
     @Published var errorMessage: String?
 
     private let scriptDirectory: URL
     private let savedCardsKey = "aircard.hash-scanner.cards"
+    private let savedArtworkKey = "aircard.wallet-tool.artwork"
 
     init() {
         if let resources = Bundle.main.resourceURL,
@@ -66,13 +75,14 @@ final class AppViewModel: ObservableObject {
             scriptDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         }
         loadCards()
+        loadArtwork()
         refreshDevice()
     }
 
     var isConnected: Bool { device?.connected == true && device?.udid != nil }
 
     func refreshDevice() {
-        guard !isCheckingDevice, !isScanning else { return }
+        guard !isCheckingDevice, !isScanning, !isFlashing else { return }
         isCheckingDevice = true
         status = "Checking USB connection…"
         let directory = scriptDirectory
@@ -209,8 +219,78 @@ final class AppViewModel: ObservableObject {
 
     func clearResults() {
         cards.removeAll()
+        artwork.removeAll()
         UserDefaults.standard.removeObject(forKey: savedCardsKey)
+        UserDefaults.standard.removeObject(forKey: savedArtworkKey)
         status = "Saved results cleared."
+    }
+
+    func chooseArtwork(for hashes: [String]) {
+        guard !hashes.isEmpty, !isFlashing else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = "Choose artwork for the selected Wallet card(s)."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        for hash in hashes { artwork[hash] = url }
+        saveArtwork()
+        status = "Artwork selected for \(hashes.count) card(s)."
+    }
+
+    func clearArtwork(for hash: String) {
+        artwork.removeValue(forKey: hash)
+        saveArtwork()
+    }
+
+    func applyCovers(hashes: [String]? = nil) {
+        guard isConnected, !isFlashing, !isScanning else { return }
+        let requested = Set(hashes ?? Array(artwork.keys))
+        let jobs = cards.compactMap { card -> (String, URL)? in
+            guard requested.contains(card.hash), let url = artwork[card.hash] else { return nil }
+            return (card.hash, url)
+        }
+        guard !jobs.isEmpty else {
+            errorMessage = "Choose artwork for at least one card first."
+            return
+        }
+
+        isFlashing = true
+        flashProgress = 0
+        status = "Applying Wallet covers…"
+        errorMessage = nil
+        let directory = scriptDirectory
+
+        Task.detached {
+            var failures: [String] = []
+            for (index, job) in jobs.enumerated() {
+                let result = Self.runScanner(
+                    ["--flash", job.0, job.1.path], in: directory, timeout: 900
+                )
+                switch result {
+                case .success(let data):
+                    let response = try? JSONDecoder().decode(OperationResponse.self, from: data)
+                    if response?.ok != true {
+                        failures.append(response?.error ?? String(job.0.prefix(10)))
+                    }
+                case .failure(let error):
+                    failures.append(error.localizedDescription)
+                }
+                await MainActor.run {
+                    self.flashProgress = Double(index + 1) / Double(jobs.count)
+                    self.status = "Applied \(index + 1) of \(jobs.count) cover(s)…"
+                }
+            }
+            await MainActor.run {
+                self.isFlashing = false
+                if failures.isEmpty {
+                    self.status = "All selected covers were applied. Reopen Wallet to refresh."
+                } else {
+                    self.status = "One or more covers could not be applied."
+                    self.errorMessage = failures.joined(separator: "\n")
+                }
+            }
+        }
     }
 
     private func saveCards() {
@@ -223,6 +303,22 @@ final class AppViewModel: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: savedCardsKey),
               let saved = try? JSONDecoder().decode([WalletCard].self, from: data) else { return }
         cards = saved
+    }
+
+    private func saveArtwork() {
+        UserDefaults.standard.set(
+            Dictionary(uniqueKeysWithValues: artwork.map { ($0.key, $0.value.path) }),
+            forKey: savedArtworkKey
+        )
+    }
+
+    private func loadArtwork() {
+        guard let stored = UserDefaults.standard.dictionary(forKey: savedArtworkKey) as? [String: String] else { return }
+        artwork = stored.reduce(into: [:]) { result, entry in
+            if FileManager.default.fileExists(atPath: entry.value) {
+                result[entry.key] = URL(fileURLWithPath: entry.value)
+            }
+        }
     }
 
     nonisolated private static func runScanner(
@@ -322,8 +418,8 @@ struct ContentView: View {
         HStack(spacing: 14) {
             Image(systemName: "wallet.bifold.fill").font(.system(size: 28)).foregroundStyle(.blue)
             VStack(alignment: .leading, spacing: 2) {
-                Text("AirCard Hash Scanner").font(.title2.bold())
-                Text(tr(language, "Direct Wallet metadata reader for macOS", "macOS Wallet 元数据直接读取工具"))
+                Text("AirCard Wallet Tool").font(.title2.bold())
+                Text(tr(language, "Wallet hash reader and cover editor for macOS", "macOS Wallet Hash 读取与封面修改工具"))
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
@@ -338,11 +434,11 @@ struct ContentView: View {
 
     private var intro: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(tr(language, "Get every Wallet card hash in one scan", "一次扫描获取全部 Wallet 卡片 Hash"))
+            Text(tr(language, "Read Wallet hashes and customize card covers", "读取 Wallet Hash 并修改卡片封面"))
                 .font(.largeTitle.bold())
             Text(tr(language,
-                    "No phone app, developer mode, LocalDevVPN or card-by-card interaction. Connect a trusted iPhone by USB and save the results for the desktop tool.",
-                    "不需要手机 App、开发者模式、LocalDevVPN，也不需要逐张操作卡片。通过 USB 连接已信任的 iPhone，并保存结果供电脑端工具使用。"))
+                    "Connect a trusted iPhone by USB, read every card at once, organize names, then apply custom covers with the original Mac AirTraffic workflow.",
+                    "通过 USB 连接已信任的 iPhone，一次读取全部卡片、整理名称，再使用原版 Mac AirTraffic 流程写入自定义封面。"))
                 .font(.title3).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -407,7 +503,7 @@ struct ContentView: View {
     }
 
     private var resultsCard: some View {
-        section(title: tr(language, "3. Save hashes", "3. 保存 Hash"), icon: "square.and.arrow.down") {
+        section(title: tr(language, "3. Manage cards and covers", "3. 管理卡片与封面"), icon: "photo.on.rectangle.angled") {
             VStack(spacing: 12) {
                 HStack {
                     Text(tr(language, "\(model.cards.count) cards found", "找到 \(model.cards.count) 张卡片")).font(.headline)
@@ -416,15 +512,40 @@ struct ContentView: View {
                     Button(tr(language, "Export JSON", "导出 JSON")) { model.exportJSON() }
                     Button(tr(language, "Clear", "清除"), role: .destructive) { model.clearResults() }
                 }
+                HStack {
+                    Button {
+                        model.chooseArtwork(for: model.cards.map(\.hash))
+                    } label: {
+                        Label(tr(language, "Choose cover for all", "为全部卡片选择封面"), systemImage: "photo.badge.plus")
+                    }
+                    Button {
+                        model.applyCovers()
+                    } label: {
+                        Label(tr(language, "Apply selected covers", "写入已选择的封面"), systemImage: "wand.and.stars")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!model.isConnected || model.isFlashing || model.artwork.isEmpty)
+                    Spacer()
+                    if model.isFlashing {
+                        ProgressView(value: model.flashProgress).frame(width: 150)
+                        Text("\(Int(model.flashProgress * 100))%")
+                            .font(.system(.caption, design: .monospaced))
+                    }
+                }
                 Divider()
                 LazyVStack(spacing: 8) {
                     ForEach(model.cards) { card in
                         EditableCardRow(
                             language: language,
                             card: card,
+                            artworkURL: model.artwork[card.hash],
+                            isFlashing: model.isFlashing,
                             onRename: { model.renameCard(hash: card.hash, name: $0) },
                             onResetName: { model.renameCard(hash: card.hash, name: "") },
-                            onCopy: { model.copy(card.hash) }
+                            onCopy: { model.copy(card.hash) },
+                            onChooseArtwork: { model.chooseArtwork(for: [card.hash]) },
+                            onClearArtwork: { model.clearArtwork(for: card.hash) },
+                            onApplyArtwork: { model.applyCovers(hashes: [card.hash]) }
                         )
                     }
                 }
@@ -437,11 +558,11 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 9) {
                 Text(tr(language,
                         "Reading protected Wallet metadata may temporarily remove cards from Wallet. Save the hashes immediately and use them only with the desktop tool.",
-                        "读取受保护的 Wallet 元数据可能会让卡片暂时从 Wallet 消失。请立即保存 Hash，并且只在电脑端工具中使用。"))
+                        "读取受保护的 Wallet 元数据可能会让卡片暂时从 Wallet 消失。请立即保存 Hash；封面修改仅作用于对应卡片的 Wallet 素材和渲染缓存。"))
                     .font(.headline)
                 Text(tr(language,
-                        "Restart the iPhone and wait several minutes. If cards do not return, open Settings › Wallet & Apple Pay › AutoFill Cards, select any existing card and try to add it. After iOS says the card already exists, reopen Wallet.",
-                        "请重启 iPhone 并等待几分钟。若卡片没有恢复，请打开“设置 › 钱包与 Apple Pay › 自动填充卡片”，选择任意原有卡片并尝试添加。系统提示卡片已存在后，重新打开 Wallet。"))
+                        "Restart the iPhone and wait several minutes. If cards do not return, open Settings › Wallet & Apple Pay › AutoFill Cards, select any existing card and try to add it. After iOS says the card already exists, reopen Wallet. When recovery is complete, also open Express Transit Card and reselect your default transit card if it was reset.",
+                        "请重启 iPhone 并等待几分钟。若卡片没有恢复，请打开“设置 › 钱包与 Apple Pay › 自动填充卡片”，选择任意原有卡片并尝试添加。系统提示卡片已存在后，重新打开 Wallet。恢复完成后，还要进入“快捷交通卡”重新选择默认交通卡（如果该设置已被重置）。"))
                     .foregroundStyle(.secondary)
             }
         }
@@ -462,29 +583,59 @@ struct ContentView: View {
 private struct EditableCardRow: View {
     let language: AppLanguage
     let card: WalletCard
+    let artworkURL: URL?
+    let isFlashing: Bool
     let onRename: (String) -> Void
     let onResetName: () -> Void
     let onCopy: () -> Void
+    let onChooseArtwork: () -> Void
+    let onClearArtwork: () -> Void
+    let onApplyArtwork: () -> Void
     @State private var draftName: String
 
     init(
         language: AppLanguage,
         card: WalletCard,
+        artworkURL: URL?,
+        isFlashing: Bool,
         onRename: @escaping (String) -> Void,
         onResetName: @escaping () -> Void,
-        onCopy: @escaping () -> Void
+        onCopy: @escaping () -> Void,
+        onChooseArtwork: @escaping () -> Void,
+        onClearArtwork: @escaping () -> Void,
+        onApplyArtwork: @escaping () -> Void
     ) {
         self.language = language
         self.card = card
+        self.artworkURL = artworkURL
+        self.isFlashing = isFlashing
         self.onRename = onRename
         self.onResetName = onResetName
         self.onCopy = onCopy
+        self.onChooseArtwork = onChooseArtwork
+        self.onClearArtwork = onClearArtwork
+        self.onApplyArtwork = onApplyArtwork
         _draftName = State(initialValue: card.displayName)
     }
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: "creditcard.fill").foregroundStyle(.blue)
+            Group {
+                if let artworkURL, let image = NSImage(contentsOf: artworkURL) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Image(systemName: "creditcard.fill")
+                        .resizable()
+                        .scaledToFit()
+                        .padding(10)
+                        .foregroundStyle(.blue)
+                }
+            }
+            .frame(width: 76, height: 48)
+            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
             VStack(alignment: .leading, spacing: 3) {
                 TextField(tr(language, "Card name", "卡片名称"), text: $draftName)
                     .textFieldStyle(.plain)
@@ -506,6 +657,20 @@ private struct EditableCardRow: View {
             Button(action: onCopy) { Image(systemName: "doc.on.doc") }
                 .buttonStyle(.borderless)
                 .help(tr(language, "Copy hash", "复制 Hash"))
+            Button(action: onChooseArtwork) { Image(systemName: "photo.badge.plus") }
+                .buttonStyle(.borderless)
+                .help(tr(language, "Choose cover", "选择封面"))
+                .disabled(isFlashing)
+            if artworkURL != nil {
+                Button(action: onClearArtwork) { Image(systemName: "xmark.circle") }
+                    .buttonStyle(.borderless)
+                    .help(tr(language, "Clear selected cover", "清除已选择封面"))
+                    .disabled(isFlashing)
+                Button(action: onApplyArtwork) { Image(systemName: "wand.and.stars") }
+                    .buttonStyle(.borderedProminent)
+                    .help(tr(language, "Apply this cover", "写入这张封面"))
+                    .disabled(isFlashing)
+            }
         }
         .padding(12)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))

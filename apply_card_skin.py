@@ -60,6 +60,35 @@ def build_archive(target: str, payload: bytes) -> bytes:
     return output.getvalue()
 
 
+def build_archive_multi(target: str, files: list[tuple[str, bytes]]) -> bytes:
+    """Build one AirTraffic archive containing every standard Wallet asset."""
+    target_tail = target.lstrip("/")
+    metadata = plistlib.dumps({"Version": 2}, fmt=plistlib.FMT_BINARY, sort_keys=True)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", allowZip64=False) as archive:
+        archive.writestr(zip_info("META-INF/", stat.S_IFDIR | 0o755), b"")
+        archive.writestr(
+            zip_info("META-INF/com.apple.ZipMetadata.plist", stat.S_IFREG | 0o600),
+            metadata,
+        )
+        for directory in ("p0/", "p0/p1/", "p0/p1/p2/"):
+            archive.writestr(zip_info(directory, stat.S_IFDIR | 0o755), b"")
+        archive.writestr(
+            zip_info("p0/p1/p2/link", stat.S_IFLNK | 0o777),
+            f"../../../{target_tail}".encode(),
+        )
+        cursor = ""
+        for component in target_tail.split("/"):
+            if component:
+                cursor += component + "/"
+                archive.writestr(zip_info(cursor, stat.S_IFDIR | 0o755), b"")
+        for index, (_leaf, payload) in enumerate(files):
+            archive.writestr(zip_info(f"payload_{index}", stat.S_IFREG | 0o600), payload)
+        if files:
+            archive.writestr(zip_info("payload", stat.S_IFREG | 0o600), files[0][1])
+    return output.getvalue()
+
+
 def build_books(identifiers: list[str]) -> bytes:
     rows = [
         {"Persistent ID": identifier, "Item ID": str(index), "DSID": "1"}
@@ -211,3 +240,110 @@ def read_file(udid: str, target: str, leaf: str, retries: int = 1) -> bytes | No
         if attempt < retries:
             time.sleep(0.3 * attempt)
     return None
+
+
+def write_files_batch(
+    udid: str, target: str, files: list[tuple[str, bytes]], retries: int = 3
+) -> bool:
+    """Write all Wallet artwork files in one AirTraffic session."""
+    if not files:
+        return True
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            token = secrets.token_hex(10)
+            source = f"{SOURCE_PREFIX}{token}"
+            link_destination = f"{LINK_PREFIX}{token}"
+            recovered = f"{RECOVERED_PREFIX}{token}"
+            identifiers = [f"../../{source}/p0/p1/p2/link"]
+            destinations = [link_destination]
+            for index, (leaf, _payload) in enumerate(files):
+                identifiers.append(f"../../{source}/payload_{index}")
+                destinations.append(posixpath.join(link_destination, leaf))
+
+            with tempfile.TemporaryDirectory(prefix="airlift-batch-") as temporary:
+                work = Path(temporary)
+                archive_path = work / "payload.zip"
+                books_path = work / "Books.plist"
+                snapshot_root = work / "books-snapshot"
+                snapshot_root.mkdir()
+                archive_path.write_bytes(build_archive_multi(target, files))
+                books_path.write_bytes(build_books(identifiers))
+
+                snapshot = native("snapshot-books", udid, os.fspath(snapshot_root))
+                if not operation_ok(snapshot):
+                    raise RuntimeError("could not snapshot Books state")
+                stage = native(
+                    "stage", udid, source, link_destination, recovered,
+                    os.fspath(archive_path), os.fspath(books_path), os.fspath(snapshot_root),
+                )
+                if not operation_ok(stage):
+                    raise RuntimeError("could not stage batch write")
+                command = [os.fspath(AIRTRAFFIC_HOST), udid]
+                for identifier, destination in zip(identifiers, destinations):
+                    command.extend((identifier, destination))
+                airtraffic = run_json(command, timeout=max(120, len(files) * 2))
+                finish = native(
+                    "finish-write", udid, source, link_destination, recovered,
+                    os.fspath(snapshot_root),
+                )
+            if airtraffic.get("exitCode") == 0 and airtraffic.get("ok") and operation_ok(finish):
+                return True
+        except Exception:
+            pass
+        if attempt < retries:
+            time.sleep(0.4 * attempt)
+    return False
+
+
+def remove_files(udid: str, target: str, leaves: list[str], retries: int = 3) -> bool:
+    """Really unlink rendered Wallet files so Wallet rebuilds the new cover."""
+    if not leaves:
+        return True
+    if any(not leaf or "/" in leaf or leaf in {".", ".."} for leaf in leaves):
+        raise ValueError("leaves must be plain file names")
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            token = secrets.token_hex(10)
+            source = f"{SOURCE_PREFIX}{token}"
+            link_destination = f"{LINK_PREFIX}{token}"
+            recovered = f"{RECOVERED_PREFIX}{token}"
+            link_identifier = f"../../{source}/p0/p1/p2/link"
+            protected = [f"../../{link_destination}/{leaf}" for leaf in leaves]
+            removed = [f"{source}/removed-{index}" for index in range(len(leaves))]
+
+            with tempfile.TemporaryDirectory(prefix="airlift-remove-") as temporary:
+                work = Path(temporary)
+                archive_path = work / "payload.zip"
+                books_path = work / "Books.plist"
+                snapshot_root = work / "books-snapshot"
+                snapshot_root.mkdir()
+                archive_path.write_bytes(build_archive(target, b"aircard-cache-removal"))
+                books_path.write_bytes(build_books([link_identifier, *protected]))
+                snapshot = native("snapshot-books", udid, os.fspath(snapshot_root))
+                if not operation_ok(snapshot):
+                    raise RuntimeError("could not snapshot Books state")
+                stage = native(
+                    "stage", udid, source, link_destination, recovered,
+                    os.fspath(archive_path), os.fspath(books_path), os.fspath(snapshot_root),
+                )
+                if not operation_ok(stage):
+                    raise RuntimeError("could not stage cache removal")
+                command = [os.fspath(AIRTRAFFIC_HOST), udid, link_identifier, link_destination]
+                for identifier, destination in zip(protected, removed):
+                    command.extend((identifier, destination))
+                airtraffic = run_json(command, timeout=120)
+                if airtraffic.get("exitCode") != 0 or not airtraffic.get("ok"):
+                    native("finish-write", udid, source, link_destination, recovered,
+                           os.fspath(snapshot_root))
+                    raise RuntimeError("could not move rendered cache files")
+                finish = native(
+                    "finish-moved-removal", udid, source, link_destination, recovered,
+                    os.fspath(snapshot_root), str(len(leaves)),
+                )
+                if operation_ok(finish):
+                    return True
+        except Exception:
+            pass
+        if attempt < retries:
+            time.sleep(0.4 * attempt)
+    return False
