@@ -18,9 +18,12 @@ jobs:
 
       - name: Run Wallet tool tests
         run: |
-          python3 -m unittest tests.test_read_file tests.test_wallet_scanner
+          python3 -m unittest tests.test_wallet_scanner tests.test_wallet_catalog
           python3 tests/verify_scanner_only.py
-          python3 -m py_compile wallet_scanner.py apply_card_skin.py card_assets.py
+          python3 -m py_compile wallet_scanner.py wallet_catalog.py apply_card_skin.py card_assets.py
+          swiftc Sources/WalletDiscovery.swift tests/test_wallet_discovery.swift \
+            -o /tmp/test_wallet_discovery
+          /tmp/test_wallet_discovery
 
       - name: Build universal macOS app and DMG
         run: |
@@ -53,17 +56,17 @@ jobs:
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: AirCard Wallet Tool v1.0.0
+          tag_name: v1.1.0
+          name: AirCard Wallet Tool v1.1.0
           target_commitish: main
           body: |
             ## English
-            macOS tool for scanning Wallet card hashes, editing card names, batch importing hashes, previewing artwork, and applying custom card covers.
+            Non-destructive macOS Wallet tool using AirCard v1.2.6-style read-only unified-log discovery. Supports card names, batch hash import, artwork preview, and custom covers.
 
             After writing a cover, completely quit and reopen Wallet on the iPhone.
 
             ## 中文
-            macOS 钱包卡片工具，支持扫描卡片 Hash、修改卡片名称、批量导入 Hash、拖拽预览图片以及写入自定义卡片封面。
+            使用 AirCard v1.2.6 同款只读统一日志扫描方案的 macOS 钱包卡片工具。支持卡片名称、批量导入 Hash、拖拽预览以及写入自定义封面。
 
             写入封面完成后，请在 iPhone 上完全退出并重新打开钱包 App。
           files: |

@@ -34,8 +34,8 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'EOF'
     <key>CFBundleDisplayName</key><string>AirCard Wallet Tool</string>
     <key>CFBundleIconFile</key><string>AirCardWalletTool</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.0.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>1.1.0</string>
+    <key>CFBundleVersion</key><string>2</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -44,7 +44,7 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'EOF'
 EOF
 
 cp build/device_helper build/airtraffic_host "$BIN_DIR/"
-cp wallet_scanner.py apply_card_skin.py card_assets.py "$RESOURCES_DIR/"
+cp wallet_scanner.py wallet_catalog.py apply_card_skin.py card_assets.py "$RESOURCES_DIR/"
 
 if [[ ! -f "$ICON_MASTER" ]]; then
     echo "Missing icon master: $ICON_MASTER" >&2
@@ -61,9 +61,9 @@ iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/AirCardWalletTool.icns"
 echo "==> [3/5] Compiling universal SwiftUI application"
 SWIFT_SDK="${SWIFT_SDK:-$(xcrun --sdk macosx --show-sdk-path)}"
 swiftc -sdk "$SWIFT_SDK" -O -parse-as-library -target arm64-apple-macosx14.0 \
-    AirCardApp.swift -o build/AirCardWalletTool-arm64
+    AirCardApp.swift Sources/WalletDiscovery.swift -o build/AirCardWalletTool-arm64
 swiftc -sdk "$SWIFT_SDK" -O -parse-as-library -target x86_64-apple-macosx14.0 \
-    AirCardApp.swift -o build/AirCardWalletTool-x86_64
+    AirCardApp.swift Sources/WalletDiscovery.swift -o build/AirCardWalletTool-x86_64
 lipo -create -output "${MACOS_DIR}/AirCardWalletTool" \
     build/AirCardWalletTool-arm64 build/AirCardWalletTool-x86_64
 

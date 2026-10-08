@@ -14,7 +14,7 @@ private func tr(_ language: AppLanguage, _ english: String, _ chinese: String) -
 
 struct WalletCard: Codable, Identifiable, Hashable {
     let hash: String
-    let name: String?
+    var name: String?
     var customName: String?
     var id: String { hash }
 
@@ -37,12 +37,6 @@ struct DeviceInfo: Decodable {
     let name: String?
     let version: String?
     let product: String?
-    let error: String?
-}
-
-private struct ScanResponse: Decodable {
-    let ok: Bool
-    let cards: [WalletCard]?
     let error: String?
 }
 
@@ -71,7 +65,11 @@ final class AppViewModel: ObservableObject {
     private let scriptDirectory: URL
     private let savedCardsKey = "aircard.hash-scanner.cards"
     private let savedArtworkKey = "aircard.wallet-tool.artwork"
-    private var scanProgressTask: Task<Void, Never>?
+    private var scanProcess: Process?
+    private var scanIDs = Set<String>()
+    private var pendingActivationIDs = Set<String>()
+    private var walletCatalog = WalletCatalog.empty
+    private var catalogRefreshTask: Task<Void, Never>?
     private var flashProgressTask: Task<Void, Never>?
     private var flashCompletedCount = 0
     private var flashTotalCount = 1
@@ -118,70 +116,196 @@ final class AppViewModel: ObservableObject {
     }
 
     func scanWallet() {
-        guard isConnected, !isScanning else { return }
+        guard isConnected, !isScanning, !isFlashing,
+              let udid = device?.udid else { return }
+        let helper = scriptDirectory.appendingPathComponent("bin/device_helper")
+        let developmentHelper = scriptDirectory.appendingPathComponent("build/device_helper")
+        let executable = FileManager.default.isExecutableFile(atPath: helper.path)
+            ? helper : developmentHelper
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+            errorMessage = "The bundled device log helper is missing. Reinstall or rebuild the app."
+            return
+        }
+
         isScanning = true
-        scanProgress = 0.03
-        status = "Reading Wallet metadata. Do not disconnect the iPhone…"
+        scanProgress = 0.08
+        scanIDs = []
+        pendingActivationIDs = []
+        status = "Connecting to the read-only Wallet log stream…"
         errorMessage = nil
-        let progressFile = FileManager.default.temporaryDirectory
-            .appendingPathComponent("aircard-scan-\(UUID().uuidString).progress")
-        try? "0.03".write(to: progressFile, atomically: true, encoding: .utf8)
-        beginScanProgress(from: progressFile)
-        let directory = scriptDirectory
+
+        refreshWalletCatalog()
+        let pipe = Pipe()
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["syslog", udid]
+        process.standardOutput = pipe
+        process.standardError = pipe
+        scanProcess = process
+
+        do {
+            try process.run()
+            scanProgress = 0.18
+        } catch {
+            scanProcess = nil
+            isScanning = false
+            status = "Could not start Wallet log scanning."
+            errorMessage = error.localizedDescription
+            return
+        }
+
         Task.detached {
-            let result = Self.runScanner(
-                ["--scan", "--progress-file", progressFile.path],
-                in: directory,
-                timeout: 900
-            )
-            await MainActor.run {
-                self.scanProgressTask?.cancel()
-                self.scanProgressTask = nil
-                try? FileManager.default.removeItem(at: progressFile)
-                self.isScanning = false
-                switch result {
-                case .success(let data):
-                    guard let response = try? JSONDecoder().decode(ScanResponse.self, from: data) else {
-                        self.status = "Wallet scan failed."
-                        self.errorMessage = "The scanner returned an invalid response."
-                        return
+            let handle = pipe.fileHandleForReading
+            var buffer = Data()
+            do {
+                while true {
+                    let chunk = try handle.read(upToCount: 65_536) ?? Data()
+                    if chunk.isEmpty {
+                        if buffer.isEmpty { break }
+                        buffer.append(0x0A)
+                    } else {
+                        buffer.append(chunk)
                     }
-                    guard response.ok, let found = response.cards, !found.isEmpty else {
-                        self.status = "No card hashes were found."
-                        self.errorMessage = response.error ?? "No Wallet cards were returned."
-                        return
+
+                    while let newline = buffer.range(of: Data([0x0A])) {
+                        let lineData = buffer.subdata(in: buffer.startIndex..<newline.lowerBound)
+                        buffer.removeSubrange(buffer.startIndex..<newline.upperBound)
+                        guard let line = String(data: lineData, encoding: .utf8) else { continue }
+                        await self.processWalletLogLine(line, process: process)
                     }
-                    let aliases = Dictionary(uniqueKeysWithValues: self.cards.compactMap { card in
-                        card.customName.map { (card.hash, $0) }
-                    })
-                    self.cards = found.map { card in
-                        var merged = card
-                        merged.customName = aliases[card.hash]
-                        return merged
-                    }
-                    self.saveCards()
-                    self.scanProgress = 1
-                    self.status = "Found \(found.count) cards. Save the hashes now."
-                    self.showPostScanReminder = true
-                case .failure(let error):
-                    self.status = "Wallet scan failed."
+                    if chunk.isEmpty { break }
+                }
+                process.waitUntilExit()
+                await MainActor.run {
+                    guard self.scanProcess === process else { return }
+                    self.scanProcess = nil
+                    self.isScanning = false
+                    self.scanProgress = self.scanIDs.isEmpty ? 0 : 1
+                    self.status = self.scanIDs.isEmpty
+                        ? "The log stream ended before any card hashes were detected."
+                        : "Found and saved \(self.scanIDs.count) card hash(es)."
+                    self.showPostScanReminder = !self.scanIDs.isEmpty
+                }
+            } catch {
+                if process.isRunning { process.terminate() }
+                process.waitUntilExit()
+                await MainActor.run {
+                    guard self.scanProcess === process else { return }
+                    self.scanProcess = nil
+                    self.isScanning = false
+                    self.status = "Wallet log scanning stopped unexpectedly."
                     self.errorMessage = error.localizedDescription
                 }
             }
         }
     }
 
-    private func beginScanProgress(from progressFile: URL) {
-        scanProgressTask?.cancel()
-        scanProgressTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 180_000_000)
-                guard let self, self.isScanning else { return }
-                guard let text = try? String(contentsOf: progressFile, encoding: .utf8),
-                      let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-                    continue
+    func stopWalletScan() {
+        guard isScanning else { return }
+        let process = scanProcess
+        scanProcess = nil
+        if let process, process.isRunning { process.terminate() }
+        isScanning = false
+        scanProgress = scanIDs.isEmpty ? 0 : 1
+        saveCards()
+        if scanIDs.isEmpty {
+            status = "No hashes detected. Open Wallet once, then scan again."
+        } else {
+            status = "Found and saved \(scanIDs.count) card hash(es)."
+            showPostScanReminder = true
+        }
+    }
+
+    private func processWalletLogLine(_ line: String, process: Process) {
+        guard scanProcess === process else { return }
+        if line.hasPrefix("AirCard scanner: ") {
+            if line.contains("Connected to the unified") {
+                scanProgress = max(scanProgress, 0.28)
+                status = "Scanner connected. Open Wallet briefly to expose the card list."
+            }
+            return
+        }
+
+        let lower = line.lowercased()
+        let isWalletSubsystem = lower.contains("passd") ||
+            lower.contains("passbook") || lower.contains("passkit") ||
+            lower.contains("nfcd") || lower.contains("stockholm") ||
+            lower.contains("nanopassd") || lower.contains("wallet") ||
+            lower.contains("pdcardfilemanager") || lower.contains("pdpasslibrary") ||
+            lower.contains("verificationcheck") || lower.contains("/cards/")
+        guard isWalletSubsystem else { return }
+
+        let isWalletContext = lower.contains("card") || lower.contains("pass") ||
+            lower.contains("payment") || lower.contains("pkpass") ||
+            lower.contains("uniqueid") || lower.contains("identifier") ||
+            lower.contains("face") || lower.contains("cache") ||
+            lower.contains("stockholm") || lower.contains("verificationcheck") ||
+            lower.contains("/cards/")
+        guard isWalletContext else { return }
+
+        for activationID in WalletScanParser.activationIDs(in: line) {
+            if let card = walletCatalog.payment(forActivationID: activationID) {
+                recordDetectedCard(card.id, name: card.name)
+            } else {
+                pendingActivationIDs.insert(activationID)
+            }
+        }
+
+        var candidates = WalletScanParser.cardIDs(in: line)
+        if candidates.isEmpty { candidates = WalletScanParser.fallbackCardIDs(in: line) }
+        for id in candidates { recordDetectedCard(id, name: walletCatalog.name(for: id)) }
+    }
+
+    private func recordDetectedCard(_ id: String, name: String?) {
+        guard !WalletScanParser.placeholders.contains(id) else { return }
+        let isNewThisScan = scanIDs.insert(id).inserted
+        if let index = cards.firstIndex(where: { $0.hash == id }) {
+            if let name, !name.isEmpty { cards[index].name = name }
+        } else {
+            cards.append(WalletCard(hash: id, name: name, customName: nil))
+        }
+        guard isNewThisScan else { return }
+        saveCards()
+        if name == nil && walletCatalog.name(for: id) == nil {
+            catalogRefreshTask?.cancel()
+            catalogRefreshTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 700_000_000)
+                guard !Task.isCancelled else { return }
+                self.refreshWalletCatalog()
+            }
+        }
+        let scaled = 0.34 + min(0.58, log2(Double(scanIDs.count) + 1) * 0.12)
+        scanProgress = max(scanProgress, scaled)
+        status = "Detected \(scanIDs.count) card hash(es). Keep Wallet open briefly, then finish scanning."
+    }
+
+    private func refreshWalletCatalog() {
+        guard let product = device?.product else { return }
+        let directory = scriptDirectory
+        let confirmedIDs = cards.map(\.hash)
+        Task.detached {
+            let result = Self.readLocalWalletCatalog(
+                product: product,
+                confirmedIDs: confirmedIDs,
+                in: directory
+            )
+            await MainActor.run {
+                guard case .success(let catalog) = result else { return }
+                self.walletCatalog = catalog
+                for index in self.cards.indices {
+                    if let name = catalog.name(for: self.cards[index].hash) {
+                        self.cards[index].name = name
+                    }
                 }
-                self.scanProgress = min(0.98, max(self.scanProgress, value))
+                for activationID in self.pendingActivationIDs {
+                    if let card = catalog.payment(forActivationID: activationID) {
+                        self.recordDetectedCard(card.id, name: card.name)
+                    }
+                }
+                self.pendingActivationIDs = self.pendingActivationIDs.filter {
+                    catalog.payment(forActivationID: $0) == nil
+                }
+                self.saveCards()
             }
         }
     }
@@ -415,6 +539,48 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    nonisolated private static func readLocalWalletCatalog(
+        product: String, confirmedIDs: [String], in directory: URL
+    ) -> Result<WalletCatalog, Error> {
+        let script = directory.appendingPathComponent("wallet_catalog.py")
+        guard FileManager.default.fileExists(atPath: script.path) else {
+            return .success(.empty)
+        }
+        let candidates = ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"]
+        guard let python = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            return .success(.empty)
+        }
+        do {
+            let request = try JSONSerialization.data(withJSONObject: [
+                "product": product,
+                "confirmedIDs": confirmedIDs,
+            ])
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: python)
+            process.arguments = [script.path]
+            process.currentDirectoryURL = directory
+            let input = Pipe()
+            let output = Pipe()
+            let errors = Pipe()
+            process.standardInput = input
+            process.standardOutput = output
+            process.standardError = errors
+            try process.run()
+            input.fileHandleForWriting.write(request)
+            try input.fileHandleForWriting.close()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                let detail = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+                throw NSError(domain: "AirCardWalletCatalog", code: Int(process.terminationStatus),
+                              userInfo: [NSLocalizedDescriptionKey: detail ?? "Local Wallet cache lookup failed."])
+            }
+            return .success(try JSONDecoder().decode(WalletCatalog.self, from: data))
+        } catch {
+            return .failure(error)
+        }
+    }
+
     nonisolated private static func runScanner(
         _ arguments: [String], in directory: URL, timeout: TimeInterval = 60
     ) -> Result<Data, Error> {
@@ -478,7 +644,7 @@ struct ContentView: View {
                     connectionCard
                     scanCard
                     if !model.cards.isEmpty { resultsCard }
-                    recoveryCard
+                    safetyCard
                 }
                 .padding(24)
                 .frame(maxWidth: 880)
@@ -487,21 +653,21 @@ struct ContentView: View {
         }
         .frame(minWidth: 820, minHeight: 720)
         .background(Color(nsColor: .windowBackgroundColor))
-        .alert(tr(language, "Read Wallet now?", "现在读取 Wallet？"), isPresented: $showScanConfirmation) {
+        .alert(tr(language, "Start read-only Wallet scan?", "开始只读 Wallet 扫描？"), isPresented: $showScanConfirmation) {
             Button(tr(language, "Cancel", "取消"), role: .cancel) {}
-            Button(tr(language, "Read Wallet", "读取 Wallet"), role: .destructive) { model.scanWallet() }
+            Button(tr(language, "Start scanning", "开始扫描")) { model.scanWallet() }
         } message: {
             Text(tr(language,
-                    "This operation temporarily moves protected Wallet metadata while reading it. Cards may disappear until the iPhone is restarted. Do not disconnect the cable.",
-                    "读取过程中会暂时移动受保护的 Wallet 元数据。卡片可能暂时消失，直到重启 iPhone。操作时不要断开数据线。"))
+                    "Scanning only listens to Wallet-related system logs. It does not move Wallet files or change card covers. Keep the iPhone connected and open Wallet briefly after scanning starts.",
+                    "扫描只监听 Wallet 相关系统日志，不会移动 Wallet 文件，也不会修改卡片封面。开始后请保持 iPhone 连接，并短暂打开一次 Wallet。"))
         }
-        .alert(tr(language, "Check Wallet before continuing", "继续前请检查 Wallet"),
+        .alert(tr(language, "Wallet scan complete", "Wallet 扫描完成"),
                isPresented: $model.showPostScanReminder) {
-            Button(tr(language, "I checked Wallet", "我已检查 Wallet"), role: .cancel) {}
+            Button(tr(language, "Done", "完成"), role: .cancel) {}
         } message: {
             Text(tr(language,
-                    "The hashes were read successfully. Open Wallet on the iPhone now. If cards disappeared or Wallet was reset, do not apply a cover yet—restart the iPhone and wait several minutes until every card has returned. Then verify the default Express Transit Card before continuing.",
-                    "Hash 已读取成功。请立即在 iPhone 上打开 Wallet 检查卡片。如果卡片消失或钱包被重置，请先不要写入封面；重启 iPhone 并等待几分钟，确认全部卡片恢复后，再检查默认快捷交通卡并继续操作。"))
+                    "The detected hashes and card names were saved automatically. This read-only scan did not move protected Wallet files or invalidate existing covers.",
+                    "检测到的 Hash 和卡片名称已自动保存。本次只读扫描没有移动受保护的 Wallet 文件，也不会使原有封面失效。"))
         }
         .alert(tr(language, "Apply selected cover?", "确认写入所选封面？"),
                isPresented: $showWriteConfirmation) {
@@ -513,8 +679,8 @@ struct ContentView: View {
             }
         } message: {
             Text(tr(language,
-                    "The preview will be written to \(pendingWriteHashes.count) card(s). Continue only after checking that Wallet and all cards have fully recovered.",
-                    "即将把预览封面写入 \(pendingWriteHashes.count) 张卡片。请仅在确认 Wallet 和全部卡片已经完全恢复后继续。"))
+                    "The preview will be written to \(pendingWriteHashes.count) card(s). This modifies Wallet artwork and clears only the corresponding rendered-cover caches.",
+                    "即将把预览封面写入 \(pendingWriteHashes.count) 张卡片。此操作会修改 Wallet 素材，并仅清理对应卡片的封面渲染缓存。"))
         }
         .alert(tr(language, "Cover update complete", "封面写入完成"),
                isPresented: $model.showWriteCompleteReminder) {
@@ -562,8 +728,8 @@ struct ContentView: View {
             Text(tr(language, "Read Wallet hashes and customize card covers", "读取 Wallet Hash 并修改卡片封面"))
                 .font(.largeTitle.bold())
             Text(tr(language,
-                    "Connect a trusted iPhone by USB, read every card at once, organize names, then apply custom covers with the original Mac AirTraffic workflow.",
-                    "通过 USB 连接已信任的 iPhone，一次读取全部卡片、整理名称，再使用原版 Mac AirTraffic 流程写入自定义封面。"))
+                    "Connect a trusted iPhone by USB, discover card hashes from Wallet's read-only system log, organize names, then apply custom covers with the original Mac AirTraffic workflow.",
+                    "通过 USB 连接已信任的 iPhone，从 Wallet 的只读系统日志发现卡片 Hash、整理名称，再使用原版 Mac AirTraffic 流程写入自定义封面。"))
                 .font(.title3).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -596,22 +762,26 @@ struct ContentView: View {
         section(title: tr(language, "2. Read Wallet", "2. 读取 Wallet"), icon: "externaldrive.badge.magnifyingglass") {
             VStack(alignment: .leading, spacing: 14) {
                 Label(tr(language,
-                         "Reads the Wallet database directly—no device logs or card-by-card detection.",
-                         "直接读取 Wallet 数据库，不使用设备日志，也不需要逐张识别卡片。"),
+                         "Read-only log scanning: no Wallet database access, file moves, or cover invalidation.",
+                         "只读日志扫描：不访问 Wallet 数据库、不移动文件，也不会让原有封面失效。"),
                       systemImage: "checkmark.shield")
                     .foregroundStyle(.secondary)
                 HStack(spacing: 10) {
-                    Button { showScanConfirmation = true } label: {
+                    Button {
+                        if model.isScanning { model.stopWalletScan() }
+                        else { showScanConfirmation = true }
+                    } label: {
                         HStack {
                             if model.isScanning { ProgressView().controlSize(.small) }
                             Image(systemName: "wallet.pass.fill")
-                            Text(model.isScanning ? tr(language, "Reading…", "正在读取…")
+                            Text(model.isScanning ? tr(language, "Finish scan", "完成扫描")
                                  : tr(language, "Read all card hashes", "读取全部卡片 Hash"))
                         }
                         .frame(maxWidth: .infinity).padding(.vertical, 8)
                     }
                     .buttonStyle(.borderedProminent).controlSize(.large)
-                    .disabled(!model.isConnected || model.isScanning)
+                    .tint(model.isScanning ? .red : .blue)
+                    .disabled(!model.isConnected || model.isFlashing)
 
                     Button {
                         showImportSheet = true
@@ -643,12 +813,12 @@ struct ContentView: View {
 
     private var scanProgressLabel: String {
         if model.scanProgress < 0.22 {
-            return tr(language, "Preparing secure Wallet access…", "正在准备安全访问 Wallet…")
+            return tr(language, "Connecting to iPhone logs…", "正在连接 iPhone 日志…")
         }
-        if model.scanProgress < 0.72 {
-            return tr(language, "Reading protected Wallet metadata…", "正在读取受保护的 Wallet 元数据…")
+        if model.scanProgress < 0.34 {
+            return tr(language, "Log scanner ready—open Wallet once…", "日志扫描器已就绪，请打开一次 Wallet…")
         }
-        return tr(language, "Restoring Wallet files and parsing cards…", "正在恢复 Wallet 文件并解析卡片…")
+        return tr(language, "Discovering card hashes from Wallet activity…", "正在从 Wallet 活动中发现卡片 Hash…")
     }
 
     private var resultsCard: some View {
@@ -736,16 +906,16 @@ struct ContentView: View {
         showWriteConfirmation = true
     }
 
-    private var recoveryCard: some View {
-        section(title: tr(language, "Important recovery information", "重要恢复说明"), icon: "exclamationmark.triangle.fill") {
+    private var safetyCard: some View {
+        section(title: tr(language, "Safe scanning and cover writing", "安全扫描与封面写入"), icon: "checkmark.shield.fill") {
             VStack(alignment: .leading, spacing: 9) {
                 Text(tr(language,
-                        "Reading protected Wallet metadata may temporarily remove cards from Wallet. Save the hashes immediately and use them only with the desktop tool.",
-                        "读取受保护的 Wallet 元数据可能会让卡片暂时从 Wallet 消失。请立即保存 Hash；封面修改仅作用于对应卡片的 Wallet 素材和渲染缓存。"))
+                        "Hash scanning is read-only and does not touch protected Wallet files.",
+                        "Hash 扫描是只读操作，不会触碰受保护的 Wallet 文件。"))
                     .font(.headline)
                 Text(tr(language,
-                        "Restart the iPhone and wait several minutes. If cards do not return, open Settings › Wallet & Apple Pay › AutoFill Cards, select any existing card and try to add it. After iOS says the card already exists, reopen Wallet. When recovery is complete, also open Express Transit Card and reselect your default transit card if it was reset.",
-                        "请重启 iPhone 并等待几分钟。若卡片没有恢复，请打开“设置 › 钱包与 Apple Pay › 自动填充卡片”，选择任意原有卡片并尝试添加。系统提示卡片已存在后，重新打开 Wallet。恢复完成后，还要进入“快捷交通卡”重新选择默认交通卡（如果该设置已被重置）。"))
+                        "Applying a cover is a separate write operation. After it finishes, completely close and reopen Wallet to refresh the rendered cover. A phone restart is not required for scanning.",
+                        "写入封面是独立的修改操作。完成后请彻底关闭并重新打开 Wallet，以刷新渲染封面；扫描本身不需要重启手机。"))
                     .foregroundStyle(.secondary)
             }
         }

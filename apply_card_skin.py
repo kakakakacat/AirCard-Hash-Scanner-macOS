@@ -20,7 +20,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DEVICE_HELPER = ROOT / "bin" / "device_helper" if (ROOT / "bin" / "device_helper").is_file() else ROOT / "build" / "device_helper"
 AIRTRAFFIC_HOST = ROOT / "bin" / "airtraffic_host" if (ROOT / "bin" / "airtraffic_host").is_file() else ROOT / "build" / "airtraffic_host"
-AIRLOCK_ROOT = "/var/mobile/Media/Airlock/Book"
 SOURCE_PREFIX = "airlift-src-"
 LINK_PREFIX = "airlift-link-"
 RECOVERED_PREFIX = "airlift-recovered-"
@@ -125,7 +124,7 @@ def operation_ok(result: dict) -> bool:
 
 
 def write_file(udid: str, target: str, leaf: str, payload: bytes, retries: int = 3) -> bool:
-    """Restore one file through the same AirTraffic primitive used for reading."""
+    """Write one Wallet artwork file through the AirTraffic primitive."""
     for attempt in range(1, max(1, retries) + 1):
         try:
             token = secrets.token_hex(10)
@@ -172,74 +171,6 @@ def write_file(udid: str, target: str, leaf: str, payload: bytes, retries: int =
         if attempt < retries:
             time.sleep(0.3 * attempt)
     return False
-
-
-def read_file(udid: str, target: str, leaf: str, retries: int = 1) -> bytes | None:
-    """Move one protected file to AFC, copy it, then restore it immediately."""
-    if "/" in leaf or leaf in ("", ".", ".."):
-        raise ValueError("leaf must be a plain file name")
-    for attempt in range(1, max(1, retries) + 1):
-        try:
-            token = secrets.token_hex(10)
-            source = f"{SOURCE_PREFIX}{token}"
-            link_destination = f"{LINK_PREFIX}{token}"
-            recovered = f"{RECOVERED_PREFIX}{token}"
-            link_identifier = f"../../{source}/p0/p1/p2/link"
-            target_path = posixpath.join(target, leaf)
-            target_identifier = posixpath.relpath(target_path, AIRLOCK_ROOT)
-            identifiers = [link_identifier, target_identifier]
-            destinations = [link_destination, recovered]
-
-            with tempfile.TemporaryDirectory(prefix="airlift-read-") as temporary:
-                work = Path(temporary)
-                archive_path = work / "payload.zip"
-                books_path = work / "Books.plist"
-                local_output = work / "recovered.bin"
-                snapshot_root = work / "books-snapshot"
-                snapshot_root.mkdir()
-                archive_path.write_bytes(build_archive(target, b"aircard-read-staging"))
-                books_path.write_bytes(build_books(identifiers))
-
-                snapshot = native("snapshot-books", udid, os.fspath(snapshot_root))
-                if not operation_ok(snapshot):
-                    raise RuntimeError("could not snapshot Books state")
-                stage = native(
-                    "stage", udid, source, link_destination, recovered,
-                    os.fspath(archive_path), os.fspath(books_path), os.fspath(snapshot_root),
-                )
-                if not operation_ok(stage):
-                    native("finish-write", udid, source, link_destination, recovered,
-                           os.fspath(snapshot_root))
-                    raise RuntimeError("could not stage protected-file read")
-
-                command = [os.fspath(AIRTRAFFIC_HOST), udid]
-                for identifier, destination in zip(identifiers, destinations):
-                    command.extend((identifier, destination))
-                airtraffic = run_json(command, timeout=120)
-                if airtraffic.get("exitCode") != 0 or not airtraffic.get("ok"):
-                    native("finish-write", udid, source, link_destination, recovered,
-                           os.fspath(snapshot_root))
-                    raise RuntimeError("AirTraffic read failed")
-
-                copied = native("afc-read", udid, recovered, os.fspath(local_output))
-                if not operation_ok(copied) or not local_output.is_file():
-                    # Keep the recovered file in Media; cleanup here could destroy the only copy.
-                    return None
-                data = local_output.read_bytes()
-                restored = write_file(udid, target, leaf, data, retries=3)
-                finish = native(
-                    "finish-write", udid, source, link_destination, recovered,
-                    os.fspath(snapshot_root),
-                )
-                if restored and operation_ok(finish):
-                    return data
-                if data:
-                    return data
-        except Exception:
-            pass
-        if attempt < retries:
-            time.sleep(0.3 * attempt)
-    return None
 
 
 def write_files_batch(
